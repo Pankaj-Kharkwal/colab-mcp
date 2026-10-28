@@ -44,6 +44,8 @@ class ColabWebSocketServer:
         self.port = 0
         self.connection_lock = asyncio.Lock()
         self.connection_live = asyncio.Event()
+        self.connection_closed = asyncio.Event()
+        self.connection_closed.set()
         self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
         self._server: websockets.Server | None = None
 
@@ -51,14 +53,18 @@ class ColabWebSocketServer:
         self._read_stream_writer: MemoryObjectSendStream[SessionMessage | Exception]
         self.write_stream: MemoryObjectSendStream[SessionMessage]
         self._write_stream_reader: MemoryObjectReceiveStream[SessionMessage]
+        self._new_streams()
+        self.token = secrets.token_urlsafe(16)
 
+    def _new_streams(self):
+        """Each connection gets its own streams: an MCP session closes its streams when it ends, so streams shared
+        across connections would leave every later connection with closed ones."""
         self._read_stream_writer, self.read_stream = anyio.create_memory_object_stream(
             0
         )
         self.write_stream, self._write_stream_reader = (
             anyio.create_memory_object_stream(0)
         )
-        self.token = secrets.token_urlsafe(16)
 
     async def _read_from_socket(self, websocket):
         """Listens to the socket and puts messages into the read stream."""
@@ -119,6 +125,8 @@ class ColabWebSocketServer:
 
         async with self.connection_lock:
             try:
+                self._new_streams()
+                self.connection_closed.clear()
                 self.connection_live.set()
 
                 reading_task = asyncio.create_task(self._read_from_socket(websocket))
@@ -139,6 +147,11 @@ class ColabWebSocketServer:
                 logging.error(f"Unexpected error: {e}")
             finally:
                 self.connection_live.clear()
+                # end this connection's session: it sees end-of-stream, and anything it still sends fails fast
+                # instead of blocking on a socket nobody reads
+                self._read_stream_writer.close()
+                self._write_stream_reader.close()
+                self.connection_closed.set()
 
     async def __aenter__(self):
         self._server = await websockets.serve(

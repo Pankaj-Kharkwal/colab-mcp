@@ -37,6 +37,8 @@ def mock_wss():
 class MockColabWebSocketServer:
     def __init__(self):
         self.connection_live = asyncio.Event()
+        self.connection_closed = asyncio.Event()
+        self.connection_closed.set()
         self.read_stream = AsyncMock()
         self.write_stream = AsyncMock()
         self.token = "test-token"
@@ -210,10 +212,23 @@ class TestColabProxyClient:
         self, mock_colab_transport, mock_client, mock_wss
     ):
         mock_client.return_value.__aenter__ = AsyncMock()
+        mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
         client = session.ColabProxyClient(mock_wss)
-        mock_wss.connection_live.set()
         async with client:
-            await client._start_task
+            mock_wss.connection_closed.clear()
+            mock_wss.connection_live.set()
+            await asyncio.wait_for(client._session_ready.wait(), timeout=1)
+            assert (
+                client.proxy_mcp_client
+                is mock_client.return_value.__aenter__.return_value
+            )
+
+            mock_wss.connection_live.clear()
+            mock_wss.connection_closed.set()
+            async with asyncio.timeout(1):
+                while client.proxy_mcp_client is not None:
+                    await asyncio.sleep(0.01)
+            assert not client._session_ready.is_set()
 
         mock_colab_transport.assert_called_once_with(mock_wss)
         mock_client.assert_called_with(mock_colab_transport.return_value)

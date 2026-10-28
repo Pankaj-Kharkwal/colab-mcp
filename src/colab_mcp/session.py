@@ -16,6 +16,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+import logging
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
@@ -58,21 +59,18 @@ class ColabProxyClient:
         self.wss = wss
         self.stubbed_mcp_client = Client(FastMCP())
         self.proxy_mcp_client: Client | None = None
-        self._exit_stack = AsyncExitStack()
+        self._session_ready = asyncio.Event()
         self._start_task = None
 
     def is_connected(self):
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
 
     async def await_proxy_connection(self):
+        # wait on an event, never on the session task: a timeout here must not cancel the session that a tab
+        # connecting later will need
         with contextlib.suppress(asyncio.TimeoutError):
-            # wait for the connection to be live and for the proxy client to fully initialize
-            connection_tasks = asyncio.gather(
-                self.wss.connection_live.wait(), self._start_task
-            )
             await asyncio.wait_for(
-                connection_tasks,
-                timeout=UI_CONNECTION_TIMEOUT,
+                self._session_ready.wait(), timeout=UI_CONNECTION_TIMEOUT
             )
 
     def client_factory(self):
@@ -82,10 +80,21 @@ class ColabProxyClient:
         return self.stubbed_mcp_client
 
     async def _start_proxy_client(self):
-        # blocks until a websocket connection is made successfully
-        self.proxy_mcp_client = await self._exit_stack.enter_async_context(
-            Client(ColabTransport(self.wss))
-        )
+        # one MCP session per tab connection, for the life of the server: a reloaded tab, or one that connects
+        # after a timed-out wait, gets a fresh session on fresh streams
+        while True:
+            await self.wss.connection_live.wait()
+            try:
+                async with Client(ColabTransport(self.wss)) as client:
+                    self.proxy_mcp_client = client
+                    self._session_ready.set()
+                    await self.wss.connection_closed.wait()
+            except Exception:
+                logging.exception("Colab session ended with an error")
+            finally:
+                self.proxy_mcp_client = None
+                self._session_ready.clear()
+            await self.wss.connection_closed.wait()
 
     async def __aenter__(self):
         self._start_task = asyncio.create_task(self._start_proxy_client())
@@ -94,7 +103,8 @@ class ColabProxyClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._start_task:
             self._start_task.cancel()
-        await self._exit_stack.aclose()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._start_task
 
 
 class ColabProxyMiddleware(Middleware):
